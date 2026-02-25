@@ -85,27 +85,27 @@ class SamsungTvWsClient(
         val req = Request.Builder().url(url).build()
 
         webSocket = okHttp.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(ws: WebSocket, response: Response) {}
+            override fun onOpen(webSocket: WebSocket, response: Response) {}
 
-            override fun onMessage(ws: WebSocket, text: String) {
+            override fun onMessage(webSocket: WebSocket, text: String) {
                 handleFrame(text)
             }
 
-            override fun onMessage(ws: WebSocket, bytes: okio.ByteString) {
+            override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
                 runCatching { bytes.utf8() }.getOrNull()?.let { handleFrame(it) }
             }
 
-            override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                ws.close(code, reason)
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(code, reason)
             }
 
-            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (_state.value !is SamsungConnectionState.Unauthorized) {
                     _state.value = SamsungConnectionState.Disconnected
                 }
             }
 
-            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 val msg = response?.message ?: (t.message ?: "WebSocket failure")
                 if (_state.value !is SamsungConnectionState.Unauthorized) {
                     _state.value = SamsungConnectionState.Failed(msg)

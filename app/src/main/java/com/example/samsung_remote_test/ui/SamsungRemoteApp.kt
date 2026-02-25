@@ -1,5 +1,7 @@
 package com.example.samsung_remote_test.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,6 +16,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.OutlinedTextField
@@ -181,6 +184,7 @@ private fun RemoteTab(vm: SamsungRemoteViewModel) {
             Button(onClick = { vm.sendKey("KEY_CHDOWN") }) { Text("CH-") }
             Button(onClick = { vm.sendKey("KEY_CH_LIST") }) { Text("CH LIST") }
             Button(onClick = { vm.sendKey("KEY_PRECH") }) { Text("PRE-CH") }
+            Button(onClick = { vm.sendKey("KEY_SEARCH") }) { Text("SEARCH") }
         }
 
         Divider()
@@ -348,26 +352,136 @@ private fun WolTab(vm: SamsungRemoteViewModel) {
 @Composable
 private fun MirrorTab(vm: SamsungRemoteViewModel) {
     val ui by vm.ui.collectAsState()
+
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        vm.onMediaProjectionResult(res.resultCode, res.data)
+    }
+
+    var showPicker by remember { androidx.compose.runtime.mutableStateOf(false) }
+    var selectedIp by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+
     Column(
         Modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        Text(if (ui.isProjecting) "MediaProjection: ON" else "MediaProjection: OFF")
+        if (!ui.projectionLastResult.isNullOrBlank()) Text("Last: ${ui.projectionLastResult}")
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(
+                onClick = { showPicker = true },
+                enabled = !ui.isProjecting
+            ) { Text("Start mirroring") }
+
+            Button(
+                onClick = vm::stopMediaProjection,
+                enabled = ui.isProjecting,
+                colors = ButtonDefaults.buttonColors()
+            ) { Text("Stop") }
+        }
+
+        Divider()
+
         Text(
-            if (ui.isMirroring) {
-                "Mirroring: ON (${ui.mirrorDisplayName ?: "External display"})"
+            if (ui.isSmartViewConnected) {
+                "SmartView/Wi-Fi display: CONNECTED (${ui.smartViewDisplayName ?: "External"})"
             } else {
-                "Mirroring: OFF"
+                "SmartView/Wi-Fi display: NOT CONNECTED"
             }
         )
 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(onClick = vm::openCastSettings) { Text("Open Cast/Smart View") }
+            Button(onClick = vm::openCastSettings) { Text("Open Smart View") }
             Button(onClick = vm::openWirelessDisplaySettings) { Text("Wireless display") }
         }
 
         Divider()
-        Text("Bấm Open Cast/Smart View rồi chọn TV để mirror. Khi mirror chạy, trạng thái sẽ chuyển ON.")
-        Spacer(Modifier.height(6.dp))
-        Text("Android không cho app tự tự động start Miracast hoàn toàn, phải qua UI hệ thống.")
+        Text("Flow đúng: chọn TV + connect -> TV mở trang nhận stream -> hệ thống hỏi quyền capture -> bắt đầu gửi.")
+    }
+
+    if (showPicker) {
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            if (ui.discovered.isEmpty()) vm.startScan()
+        }
+
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showPicker = false },
+            title = { Text("Chọn TV để mirroring") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        when (val st = ui.conn) {
+                            SamsungConnectionState.Disconnected -> "State: Disconnected"
+                            SamsungConnectionState.Connecting -> "State: Connecting"
+                            is SamsungConnectionState.Connected -> "State: Connected (${st.host}:${st.port})"
+                            is SamsungConnectionState.Unauthorized -> "State: Unauthorized (hãy Allow trên TV)"
+                            is SamsungConnectionState.Failed -> "State: Failed: ${st.detail}"
+                        }
+                    )
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Button(onClick = vm::startScan) { Text(if (ui.scanning) "Scanning..." else "Scan") }
+                        Button(
+                            onClick = {
+                                val ip = selectedIp ?: return@Button
+                                val tv = ui.discovered.firstOrNull { it.ip == ip } ?: return@Button
+                                vm.pickDiscovered(tv)
+                                vm.connect()
+                            },
+                            enabled = selectedIp != null
+                        ) { Text("Connect") }
+                    }
+
+                    if (ui.discovered.isEmpty()) {
+                        Text("Chưa tìm thấy TV")
+                    } else {
+                        LazyColumn(Modifier.height(220.dp)) {
+                            items(ui.discovered) { tv ->
+                                val ip = tv.ip
+                                val name = tv.friendlyName ?: tv.modelName ?: ip
+                                Row(
+                                    Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(name)
+                                        Text(ip)
+                                    }
+                                    androidx.compose.material3.RadioButton(
+                                        selected = selectedIp == ip,
+                                        onClick = { selectedIp = ip }
+                                    )
+                                }
+                                Divider()
+                            }
+                        }
+                    }
+
+                    Text("Sau khi Connected, bấm Tiếp theo để TV mở receiver rồi mới xin quyền capture.")
+                }
+            },
+            confirmButton = {
+                val connected = ui.conn is SamsungConnectionState.Connected
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(
+                        onClick = {
+                            if (!connected) return@Button
+                            val ok = vm.prepareMirrorOnTv()
+                            if (ok) {
+                                showPicker = false
+                                launcher.launch(vm.createMediaProjectionIntent())
+                            }
+                        },
+                        enabled = connected
+                    ) { Text("Tiếp theo") }
+                }
+            },
+            dismissButton = {
+                Button(onClick = { showPicker = false }) { Text("Hủy") }
+            }
+        )
     }
 }
