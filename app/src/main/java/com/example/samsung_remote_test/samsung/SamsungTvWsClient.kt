@@ -1,9 +1,11 @@
 package com.example.samsung_remote_test.samsung
 
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -27,6 +29,9 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+
+private const val TAG_WS = "SamsungWs"
 
 sealed interface SamsungConnectionState {
     data object Disconnected : SamsungConnectionState
@@ -57,6 +62,7 @@ class SamsungTvWsClient(
     private var host: String? = null
     private var port: Int = 8002
     private var clientName: String = "SamsungTvRemote"
+
     private var pendingAppList: CompletableDeferred<List<SamsungAppInfo>?>? = null
     private val firstTextSent = AtomicBoolean(false)
     private val handshakeDone = AtomicBoolean(false)
@@ -71,8 +77,25 @@ class SamsungTvWsClient(
         "ms.channel.ready"
     )
 
+    private val sendSeq = AtomicLong(0)
+    private val lastLaunch = MutableStateFlow<String?>(null)
+
+    private data class ConnCfg(val host: String, val port: Int, val name: String, val token: String?)
+
+    private var lastCfg: ConnCfg? = null
+    private var wantConnected: Boolean = false
+    private var reconnectJob: Job? = null
+    private var handshakeTimeoutJob: Job? = null
+
     fun connect(host: String, port: Int, name: String, token: String?) {
-        close()
+        wantConnected = true
+        lastCfg = ConnCfg(host, port, name, token?.trim()?.ifBlank { null })
+
+        reconnectJob?.cancel()
+        reconnectJob = null
+
+        closeInternal()
+
         this.host = host
         this.port = port
         this.clientName = name
@@ -83,47 +106,71 @@ class SamsungTvWsClient(
 
         val url = buildWsUrl(host, port, name, _token.value)
         val req = Request.Builder().url(url).build()
+        Log.d(TAG_WS, "CONNECT url=$url")
 
         webSocket = okHttp.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {}
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                Log.d(TAG_WS, "WS onOpen code=${response.code} msg=${response.message}")
+            }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                Log.d(TAG_WS, "RECV $text")
                 handleFrame(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
-                runCatching { bytes.utf8() }.getOrNull()?.let { handleFrame(it) }
+                runCatching { bytes.utf8() }.getOrNull()?.let {
+                    Log.d(TAG_WS, "RECV(bin) $it")
+                    handleFrame(it)
+                }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                Log.d(TAG_WS, "WS onClosing code=$code reason=$reason")
                 webSocket.close(code, reason)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                Log.d(TAG_WS, "WS onClosed code=$code reason=$reason")
                 if (_state.value !is SamsungConnectionState.Unauthorized) {
                     _state.value = SamsungConnectionState.Disconnected
+                    scheduleReconnect("closed code=$code reason=$reason")
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 val msg = response?.message ?: (t.message ?: "WebSocket failure")
+                Log.e(TAG_WS, "WS onFailure msg=$msg", t)
                 if (_state.value !is SamsungConnectionState.Unauthorized) {
-                    _state.value = SamsungConnectionState.Failed(msg)
+                    _state.value = SamsungConnectionState.Disconnected
+                    scheduleReconnect("failure: $msg")
                 }
             }
         })
 
-        val waitMs = if (_token.value.isNullOrBlank()) 45000L else 8000L
-        scope.launch {
+        val waitMs = if (_token.value.isNullOrBlank()) 45000L else 15000L
+        handshakeTimeoutJob?.cancel()
+        handshakeTimeoutJob = scope.launch {
             delay(waitMs)
             if (!handshakeDone.get() && _state.value == SamsungConnectionState.Connecting) {
-                _state.value = SamsungConnectionState.Failed("Handshake timeout")
-                close()
+                Log.e(TAG_WS, "Handshake timeout host=$host port=$port tokenEmpty=${_token.value.isNullOrBlank()}")
+                _state.value = SamsungConnectionState.Disconnected
+                closeInternal()
+                scheduleReconnect("handshake-timeout")
             }
         }
     }
 
     fun close() {
+        wantConnected = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        handshakeTimeoutJob?.cancel()
+        handshakeTimeoutJob = null
+        closeInternal()
+    }
+
+    private fun closeInternal() {
         pendingAppList?.complete(null)
         pendingAppList = null
         webSocket?.close(1000, "bye")
@@ -135,10 +182,50 @@ class SamsungTvWsClient(
         }
     }
 
+    private fun scheduleReconnect(reason: String) {
+        if (!wantConnected) return
+        if (reconnectJob?.isActive == true) return
+        val cfg = lastCfg ?: return
+
+        reconnectJob = scope.launch {
+            var d = 1000L
+            repeat(12) { attempt ->
+                if (!wantConnected) return@launch
+                Log.e(TAG_WS, "RECONNECT attempt=${attempt + 1} reason=$reason delayMs=$d")
+                delay(d)
+                val tok = _token.value ?: cfg.token
+                connect(cfg.host, cfg.port, cfg.name, tok)
+                delay(1800)
+                if (_state.value is SamsungConnectionState.Connected) return@launch
+                d = (d * 2).coerceAtMost(30000L)
+            }
+        }
+    }
+
     fun isAlive(): Boolean = webSocket != null && _state.value is SamsungConnectionState.Connected
 
+    private fun send(label: String, payload: String): Boolean {
+        val ws = webSocket
+        val id = sendSeq.incrementAndGet()
+        if (ws == null) {
+            Log.e(TAG_WS, "SEND#$id $label failed: ws=null state=${_state.value}")
+            return false
+        }
+        val ok = ws.send(payload)
+        Log.d(TAG_WS, "SEND#$id $label ok=$ok payload=$payload")
+        if (!ok) {
+            Log.e(TAG_WS, "SEND#$id $label sendReturnedFalse state=${_state.value}")
+            _state.value = SamsungConnectionState.Disconnected
+            scheduleReconnect("send-false label=$label")
+        }
+        return ok
+    }
+
     fun sendKey(key: String, cmd: String = "Click", times: Int = 1) {
-        val ws = webSocket ?: return
+        if (_state.value !is SamsungConnectionState.Connected) {
+            Log.e(TAG_WS, "sendKey ignored (not connected) key=$key cmd=$cmd state=${_state.value}")
+            return
+        }
         repeat(times.coerceAtLeast(1)) {
             val payload = buildJson(
                 method = "ms.remote.control",
@@ -149,7 +236,7 @@ class SamsungTvWsClient(
                     "TypeOfRemote" to JsonPrimitive("SendRemoteKey")
                 )
             )
-            ws.send(payload)
+            send("key:$key/$cmd", payload)
         }
     }
 
@@ -162,7 +249,10 @@ class SamsungTvWsClient(
     }
 
     fun moveCursor(x: Int, y: Int, durationMs: Int = 0) {
-        val ws = webSocket ?: return
+        if (_state.value !is SamsungConnectionState.Connected) {
+            Log.e(TAG_WS, "moveCursor ignored (not connected) state=${_state.value}")
+            return
+        }
         val payload = buildJson(
             method = "ms.remote.control",
             params = mapOf(
@@ -177,11 +267,14 @@ class SamsungTvWsClient(
                 "TypeOfRemote" to JsonPrimitive("ProcessMouseDevice")
             )
         )
-        ws.send(payload)
+        send("mouse:move", payload)
     }
 
     fun sendText(text: String, end: Boolean = false) {
-        val ws = webSocket ?: return
+        if (_state.value !is SamsungConnectionState.Connected) {
+            Log.e(TAG_WS, "sendText ignored (not connected) state=${_state.value}")
+            return
+        }
         if (text.isBlank()) return
 
         if (firstTextSent.compareAndSet(false, true)) {
@@ -192,7 +285,7 @@ class SamsungTvWsClient(
                     "to" to JsonPrimitive("broadcast")
                 )
             )
-            ws.send(b)
+            send("ime:broadcast", b)
         }
 
         val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
@@ -204,25 +297,32 @@ class SamsungTvWsClient(
                 "TypeOfRemote" to JsonPrimitive("SendInputString")
             )
         )
-        ws.send(payload)
+        send("ime:text", payload)
 
         if (end) endText()
     }
 
     fun endText() {
-        val ws = webSocket ?: return
+        if (_state.value !is SamsungConnectionState.Connected) {
+            Log.e(TAG_WS, "endText ignored (not connected) state=${_state.value}")
+            return
+        }
         val payload = buildJson(
             method = "ms.remote.control",
             params = mapOf(
                 "TypeOfRemote" to JsonPrimitive("SendInputEnd")
             )
         )
-        ws.send(payload)
+        send("ime:end", payload)
         firstTextSent.set(false)
     }
 
     fun runApp(appId: String, appType: String = "DEEP_LINK", metaTag: String = "") {
-        val ws = webSocket ?: return
+        if (_state.value !is SamsungConnectionState.Connected) {
+            Log.e(TAG_WS, "runApp ignored (not connected) appId=$appId type=$appType state=${_state.value}")
+            return
+        }
+        lastLaunch.value = "appId=$appId type=$appType meta=$metaTag"
         val payload = buildJson(
             method = "ms.channel.emit",
             params = mapOf(
@@ -237,15 +337,30 @@ class SamsungTvWsClient(
                 )
             )
         )
-        ws.send(payload)
+        send("app:launch", payload)
+    }
+
+    fun runAppNative(appId: String, metaTag: String = "") {
+        runApp(appId, "NATIVE_LAUNCH", metaTag)
+    }
+
+    fun runAppDeepLink(appId: String, metaTag: String) {
+        runApp(appId, "DEEP_LINK", metaTag)
     }
 
     fun openBrowser(url: String) {
+        if (_state.value !is SamsungConnectionState.Connected) {
+            Log.e(TAG_WS, "openBrowser ignored (not connected) url=$url state=${_state.value}")
+            return
+        }
         runApp("org.tizen.browser", "NATIVE_LAUNCH", url)
     }
 
-    suspend fun appList(timeoutMs: Long = 4000): List<SamsungAppInfo>? {
-        val ws = webSocket ?: return null
+    suspend fun appList(timeoutMs: Long = 12000): List<SamsungAppInfo>? {
+        if (_state.value !is SamsungConnectionState.Connected) {
+            Log.e(TAG_WS, "appList ignored (not connected) state=${_state.value}")
+            return null
+        }
         val def = CompletableDeferred<List<SamsungAppInfo>?>()
         pendingAppList?.complete(null)
         pendingAppList = def
@@ -257,7 +372,7 @@ class SamsungTvWsClient(
                 "to" to JsonPrimitive("host")
             )
         )
-        ws.send(payload)
+        send("app:list", payload)
 
         return try {
             withTimeout(timeoutMs) { def.await() }
@@ -277,7 +392,7 @@ class SamsungTvWsClient(
             if (event == "ms.channel.unauthorized") {
                 handshakeDone.set(true)
                 _state.value = SamsungConnectionState.Unauthorized(obj.toString())
-                close()
+                closeInternal()
                 return
             }
 
@@ -287,10 +402,21 @@ class SamsungTvWsClient(
                 val tok = data?.get("token")?.jsonPrimitive?.contentOrNull
                 if (!tok.isNullOrBlank()) _token.value = tok
                 _state.value = SamsungConnectionState.Connected(host.orEmpty(), port)
+                Log.d(TAG_WS, "HANDSHAKE OK host=${host.orEmpty()} port=$port token=${tok.orEmpty()}")
                 return
             }
 
             return
+        }
+
+        if (event == "ms.error") {
+            val msg = obj["data"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull
+            Log.e(TAG_WS, "MS_ERROR msg=${msg.orEmpty()} lastLaunch=${lastLaunch.value.orEmpty()} frame=$obj")
+            return
+        }
+
+        if (event == "d2d_service_message") {
+            Log.d(TAG_WS, "D2D $obj")
         }
 
         if (event == "ms.remote.imeStart" || event == "ms.remote.imeEnd") {

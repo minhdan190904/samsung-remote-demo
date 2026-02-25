@@ -1,9 +1,15 @@
 package com.example.samsung_remote_test.ui
 
+import android.annotation.SuppressLint
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,17 +20,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -32,7 +43,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.samsung_remote_test.samsung.SamsungConnectionState
@@ -43,6 +58,10 @@ import com.example.samsung_remote_test.viewmodel.SamsungRemoteViewModel
 fun SamsungRemoteApp(vm: SamsungRemoteViewModel = viewModel()) {
     var tab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Connect", "Remote", "IME", "Apps", "REST", "WOL", "Mirror")
+
+    LaunchedEffect(Unit) {
+        vm.startScan()
+    }
 
     Scaffold(modifier = Modifier.fillMaxSize()) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
@@ -142,7 +161,15 @@ private fun ConnectTab(vm: SamsungRemoteViewModel) {
 
 @Composable
 private fun RemoteTab(vm: SamsungRemoteViewModel) {
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    val scrollState = rememberScrollState()
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .verticalScroll(scrollState),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(onClick = { vm.sendKey("KEY_POWER") }) { Text("Power") }
             Button(onClick = { vm.sendKey("KEY_HOME") }) { Text("Home") }
@@ -160,7 +187,10 @@ private fun RemoteTab(vm: SamsungRemoteViewModel) {
         Divider()
 
         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Button(onClick = { vm.sendKey("KEY_UP") }, modifier = Modifier.width(120.dp)) { Text("Up") }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { vm.sendKey("KEY_LEFT") }, modifier = Modifier.width(120.dp)) { Text("Left") }
@@ -177,6 +207,7 @@ private fun RemoteTab(vm: SamsungRemoteViewModel) {
             Button(onClick = { vm.sendKey("KEY_VOLUP") }) { Text("Vol+") }
             Button(onClick = { vm.sendKey("KEY_VOLDOWN") }) { Text("Vol-") }
             Button(onClick = { vm.sendKey("KEY_MUTE") }) { Text("Mute") }
+            Button(onClick = { vm.sendKey("KEY_EXIT") }) { Text("Exit") }
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -205,12 +236,71 @@ private fun RemoteTab(vm: SamsungRemoteViewModel) {
 
         Divider()
 
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(onClick = { vm.moveCursor(-50, 0) }) { Text("Cursor L") }
-            Button(onClick = { vm.moveCursor(50, 0) }) { Text("Cursor R") }
-            Button(onClick = { vm.moveCursor(0, -50) }) { Text("Cursor U") }
-            Button(onClick = { vm.moveCursor(0, 50) }) { Text("Cursor D") }
+        Text("Test keys (quick grid)")
+
+        val testKeys = listOf(
+            "KEY_SEARCH" to "Search",
+            "KEY_PLAY" to "Play",
+            "KEY_PAUSE" to "Pause",
+            "KEY_PLAYPAUSE" to "Play/Pause",
+            "KEY_STOP" to "Stop",
+            "KEY_FF" to "FF",
+            "KEY_REWIND" to "Rew",
+            "KEY_REC" to "Rec",
+            "KEY_SUB_TITLE" to "Subtitle",
+            "KEY_CAPTION" to "Caption",
+            "KEY_AD" to "AD",
+            "KEY_AUDIO" to "Audio",
+            "KEY_PICTURE_SIZE" to "Aspect",
+            "KEY_PIP_ONOFF" to "PIP",
+            "KEY_SLEEP" to "Sleep",
+            "KEY_CONTENTS" to "Contents",
+            "KEY_SMARTHUB" to "SmartHub",
+            "KEY_APPS" to "Apps",
+            "KEY_SETTINGS" to "Settings",
+            "KEY_E_MANUAL" to "e-Manual",
+            "KEY_TTX_MIX" to "Teletext",
+            "KEY_MTS" to "MTS",
+            "KEY_MORE" to "More",
+            "KEY_CHG_MODE" to "Mode",
+            "KEY_PMODE" to "P.Mode",
+            "KEY_SMODE" to "S.Mode",
+            "KEY_SOURCE" to "Source",
+            "KEY_HOME" to "Home",
+            "KEY_RETURN" to "Back",
+            "KEY_EXIT" to "Exit",
+            "KEY_CANCEL" to "Cancel",
+            "KEY_ENTER" to "Enter"
+        )
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            testKeys.chunked(4).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    row.forEach { (k, label) ->
+                        Button(
+                            onClick = { vm.sendKey(k) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text(label) }
+                    }
+                    repeat(4 - row.size) {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
         }
+
+        Divider()
+
+        RemoteTouchpadSamsung(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(220.dp),
+            onTap = vm::touchpadTap,
+            onMove = vm::moveCursorTouchpad
+        )
     }
 }
 
@@ -242,8 +332,6 @@ private fun NumericPad(
         }
     }
 }
-
-
 
 @Composable
 private fun ImeTab(vm: SamsungRemoteViewModel) {
@@ -298,7 +386,7 @@ private fun AppsTab(vm: SamsungRemoteViewModel) {
                     Text("AppId: ${app.appId}")
                     Text("Name: ${app.name.orEmpty()}")
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Button(onClick = { vm.setRunAppId(app.appId); vm.runAppWs("DEEP_LINK", "") }) { Text("Run") }
+                        Button(onClick = { vm.setRunAppId(app.appId); vm.runAppWs("NATIVE_LAUNCH", "") }) { Text("Run") }
                     }
                 }
                 Divider()
@@ -402,7 +490,7 @@ private fun MirrorTab(vm: SamsungRemoteViewModel) {
     }
 
     if (showPicker) {
-        androidx.compose.runtime.LaunchedEffect(Unit) {
+        LaunchedEffect(Unit) {
             if (ui.discovered.isEmpty()) vm.startScan()
         }
 
@@ -483,5 +571,118 @@ private fun MirrorTab(vm: SamsungRemoteViewModel) {
                 Button(onClick = { showPicker = false }) { Text("Hủy") }
             }
         )
+    }
+}
+
+@SuppressLint("UnusedBoxWithConstraintsScope")
+@Composable
+private fun RemoteTouchpadSamsung(
+    modifier: Modifier = Modifier,
+    onTap: () -> Unit,
+    onMove: (Int, Int) -> Unit
+) {
+    val shape = RoundedCornerShape(16.dp)
+    val padColor = Color(0xFF15171A)
+    val stroke = Color(0xFF2A2E34)
+    val hintColor = Color(0xFFB7BDC6)
+
+    var accX by remember { androidx.compose.runtime.mutableStateOf(0f) }
+    var accY by remember { androidx.compose.runtime.mutableStateOf(0f) }
+    var scrollAcc by remember { androidx.compose.runtime.mutableStateOf(0f) }
+
+    Surface(
+        modifier = modifier,
+        shape = shape,
+        shadowElevation = 2.dp,
+        color = padColor
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .clip(shape)
+                .background(padColor)
+                .border(1.dp, stroke, shape)
+        ) {
+            val scrollWidth = 34.dp
+            val scrollPaddingEnd = 10.dp
+            val rightReserved = scrollWidth + scrollPaddingEnd
+
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(end = rightReserved)
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onTap = { onTap() }
+                        )
+                    }
+                    .pointerInput(Unit) {
+                        detectDragGestures(
+                            onDragStart = {
+                                accX = 0f
+                                accY = 0f
+                            },
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+
+                                val scale = 1.5f
+                                accX += dragAmount.x * scale
+                                accY += dragAmount.y * scale
+
+                                val stepX = accX.toInt()
+                                val stepY = accY.toInt()
+
+                                if (stepX != 0 || stepY != 0) {
+                                    accX -= stepX.toFloat()
+                                    accY -= stepY.toFloat()
+                                    onMove(stepX, stepY)
+                                }
+                            }
+                        )
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "Touchpad\nTap = OK • Drag = Cursor",
+                    color = hintColor.copy(alpha = 0.7f),
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = scrollPaddingEnd)
+                    .width(scrollWidth)
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF1E2227))
+                    .border(1.dp, stroke, RoundedCornerShape(14.dp))
+                    .pointerInput(Unit) {
+                        detectDragGestures(
+                            onDragStart = { scrollAcc = 0f },
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+
+                                val scale = 3.0f
+                                scrollAcc += dragAmount.y * scale
+                                val stepY = scrollAcc.toInt()
+
+                                if (stepY != 0) {
+                                    scrollAcc -= stepY.toFloat()
+                                    onMove(0, stepY)
+                                }
+                            }
+                        )
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "SCROLL",
+                    color = hintColor.copy(alpha = 0.55f),
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
     }
 }

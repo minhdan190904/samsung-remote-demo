@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.hardware.display.DisplayManager
 import android.media.projection.MediaProjectionManager
 import android.os.Handler
@@ -23,6 +24,7 @@ import com.example.samsung_remote_test.samsung.SamsungTvRestClient
 import com.example.samsung_remote_test.samsung.SamsungTvWsClient
 import com.example.samsung_remote_test.samsung.SamsungWol
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,18 +45,16 @@ data class SamsungUiState(
     val tokenCaptured: String? = null,
     val imeText: String = "",
     val browserUrl: String = "https://www.youtube.com/",
-    val runAppId: String = "org.tizen.browser",
-    val restAppId: String = "org.tizen.browser",
+    val runAppId: String = "3201606009684",
+    val restAppId: String = "3201606009684",
     val restResult: String = "",
     val apps: List<SamsungAppInfo> = emptyList(),
     val wolMac: String = "",
     val wolResult: String = "",
     val scanning: Boolean = false,
     val discovered: List<SamsungDiscoveredTv> = emptyList(),
-
     val isSmartViewConnected: Boolean = false,
     val smartViewDisplayName: String? = null,
-
     val isProjecting: Boolean = false,
     val projectionLastResult: String? = null
 )
@@ -64,6 +64,9 @@ class SamsungRemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val ws = SamsungTvWsClient(http)
     private val rest = SamsungTvRestClient(http)
     private val ssdp = SamsungSsdpDiscoverer(app.applicationContext, http)
+
+    private val prefs: SharedPreferences =
+        app.getSharedPreferences("samsung_remote_prefs", Context.MODE_PRIVATE)
 
     private val _ui = MutableStateFlow(SamsungUiState())
     val ui: StateFlow<SamsungUiState> = _ui.asStateFlow()
@@ -81,29 +84,69 @@ class SamsungRemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
+        val savedCfg = loadCfgFromPrefs()
+        _ui.value = _ui.value.copy(cfg = savedCfg)
+
         displayManager.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
         refreshSmartViewState()
 
         viewModelScope.launch {
             ws.state.collect { st ->
                 _ui.value = _ui.value.copy(conn = st)
+                if (st is SamsungConnectionState.Connected) {
+                    saveCfgToPrefs(_ui.value.cfg)
+                }
             }
         }
+
         viewModelScope.launch {
             ws.token.collect { t ->
                 if (!t.isNullOrBlank()) {
+                    val nextCfg = _ui.value.cfg.copy(token = t)
                     _ui.value = _ui.value.copy(
                         tokenCaptured = t,
-                        cfg = _ui.value.cfg.copy(token = t)
+                        cfg = nextCfg
                     )
+                    saveTokenToPrefs(t)
                 }
             }
+        }
+
+        if (savedCfg.host.isNotBlank()) {
+            ws.connect(
+                savedCfg.host,
+                savedCfg.port,
+                savedCfg.name,
+                savedCfg.token.trim().ifBlank { null }
+            )
         }
     }
 
     override fun onCleared() {
         runCatching { displayManager.unregisterDisplayListener(displayListener) }
+        runCatching { ws.close() }
         super.onCleared()
+    }
+
+    private fun loadCfgFromPrefs(): UiConfig {
+        val host = prefs.getString("host", "") ?: ""
+        val port = prefs.getInt("port", 8002)
+        val name = prefs.getString("name", "SamsungTvRemote") ?: "SamsungTvRemote"
+        val token = prefs.getString("token", "") ?: ""
+        return UiConfig(host = host, port = port, name = name, token = token)
+    }
+
+    private fun saveCfgToPrefs(cfg: UiConfig) {
+        prefs.edit()
+            .putString("host", cfg.host)
+            .putInt("port", cfg.port)
+            .putString("name", cfg.name)
+            .putString("token", cfg.token)
+            .apply()
+    }
+
+    private fun saveTokenToPrefs(token: String) {
+        prefs.edit().putString("token", token).apply()
     }
 
     private fun refreshSmartViewState() {
@@ -158,10 +201,10 @@ class SamsungRemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun onMediaProjectionResult(resultCode: Int, data: Intent?) {
         val ctx = getApplication<Application>()
         if (resultCode == Activity.RESULT_OK && data != null) {
-            val i = Intent(ctx, com.example.samsung_remote_test.mirror.MirrorService::class.java).apply {
-                action = com.example.samsung_remote_test.mirror.MirrorService.ACTION_START
-                putExtra(com.example.samsung_remote_test.mirror.MirrorService.EXTRA_RESULT_CODE, resultCode)
-                putExtra(com.example.samsung_remote_test.mirror.MirrorService.EXTRA_DATA_INTENT, data)
+            val i = Intent(ctx, MirrorService::class.java).apply {
+                action = MirrorService.ACTION_START
+                putExtra(MirrorService.EXTRA_RESULT_CODE, resultCode)
+                putExtra(MirrorService.EXTRA_DATA_INTENT, data)
             }
             ContextCompat.startForegroundService(ctx, i)
             _ui.value = _ui.value.copy(isProjecting = true, projectionLastResult = "Projection started")
@@ -190,14 +233,34 @@ class SamsungRemoteViewModel(app: Application) : AndroidViewModel(app) {
         val ctx = getApplication<Application>()
         val intent = Intent("android.settings.WIFI_DISPLAY_SETTINGS").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching { ctx.startActivity(intent) }.onFailure {
-            runCatching { ctx.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            runCatching {
+                ctx.startActivity(
+                    Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
         }
     }
 
-    fun updateHost(v: String) { _ui.value = _ui.value.copy(cfg = _ui.value.cfg.copy(host = v.trim())) }
-    fun updatePort(v: String) { _ui.value = _ui.value.copy(cfg = _ui.value.cfg.copy(port = v.toIntOrNull() ?: 8002)) }
-    fun updateName(v: String) { _ui.value = _ui.value.copy(cfg = _ui.value.cfg.copy(name = v)) }
-    fun updateToken(v: String) { _ui.value = _ui.value.copy(cfg = _ui.value.cfg.copy(token = v.trim())) }
+    fun updateHost(v: String) {
+        val next = _ui.value.cfg.copy(host = v.trim())
+        _ui.value = _ui.value.copy(cfg = next)
+    }
+
+    fun updatePort(v: String) {
+        val next = _ui.value.cfg.copy(port = v.toIntOrNull() ?: 8002)
+        _ui.value = _ui.value.copy(cfg = next)
+    }
+
+    fun updateName(v: String) {
+        val next = _ui.value.cfg.copy(name = v)
+        _ui.value = _ui.value.copy(cfg = next)
+    }
+
+    fun updateToken(v: String) {
+        val next = _ui.value.cfg.copy(token = v.trim())
+        _ui.value = _ui.value.copy(cfg = next)
+        saveTokenToPrefs(next.token)
+    }
 
     fun startScan() {
         if (scanJob?.isActive == true) return
@@ -215,33 +278,129 @@ class SamsungRemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun pickDiscovered(tv: SamsungDiscoveredTv) {
-        _ui.value = _ui.value.copy(cfg = _ui.value.cfg.copy(host = tv.ip, port = 8002))
+        val next = _ui.value.cfg.copy(host = tv.ip, port = 8002)
+        _ui.value = _ui.value.copy(cfg = next)
+        saveCfgToPrefs(next)
     }
 
     fun connect() {
         val c = _ui.value.cfg
         val tok = c.token.trim().ifBlank { null }
         if (c.host.isBlank()) return
+        saveCfgToPrefs(c)
         ws.connect(c.host, c.port, c.name, tok)
     }
 
-    fun disconnect() { ws.close() }
+    fun disconnect() {
+        ws.close()
+    }
 
-    fun sendKey(key: String) { ws.sendKey(key) }
-    fun sendKeyPress(key: String) { ws.sendKey(key, cmd = "Press") }
-    fun sendKeyRelease(key: String) { ws.sendKey(key, cmd = "Release") }
-    fun holdKey(key: String, seconds: Double) { ws.holdKey(key, seconds) }
-    fun moveCursor(dx: Int, dy: Int) { ws.moveCursor(dx, dy, 0) }
+    fun sendKey(key: String) {
+        ws.sendKey(key)
+    }
 
-    fun setImeText(v: String) { _ui.value = _ui.value.copy(imeText = v) }
-    fun sendIme(end: Boolean) { ws.sendText(_ui.value.imeText, end = end) }
-    fun endIme() { ws.endText() }
+    fun sendKeyPress(key: String) {
+        ws.sendKey(key, cmd = "Press")
+    }
 
-    fun setBrowserUrl(v: String) { _ui.value = _ui.value.copy(browserUrl = v) }
-    fun openBrowser() { ws.openBrowser(_ui.value.browserUrl) }
+    fun sendKeyRelease(key: String) {
+        ws.sendKey(key, cmd = "Release")
+    }
 
-    fun setRunAppId(v: String) { _ui.value = _ui.value.copy(runAppId = v) }
-    fun runAppWs(appType: String = "DEEP_LINK", meta: String = "") { ws.runApp(_ui.value.runAppId, appType, meta) }
+    fun holdKey(key: String, seconds: Double) {
+        ws.holdKey(key, seconds)
+    }
+
+    fun moveCursor(dx: Int, dy: Int) {
+        ws.moveCursor(dx, dy, 0)
+    }
+
+    fun setImeText(v: String) {
+        _ui.value = _ui.value.copy(imeText = v)
+    }
+
+    fun sendIme(end: Boolean) {
+        ws.sendText(_ui.value.imeText, end = end)
+    }
+
+    fun endIme() {
+        ws.endText()
+    }
+
+    fun setBrowserUrl(v: String) {
+        _ui.value = _ui.value.copy(browserUrl = v)
+    }
+
+    private var pendingMoveDx = 0
+    private var pendingMoveDy = 0
+    private var moveBatchJob: Job? = null
+
+    fun touchpadTap() {
+        ws.sendKey("KEY_ENTER")
+    }
+
+    fun moveCursorTouchpad(dx: Int, dy: Int) {
+        pendingMoveDx += dx
+        pendingMoveDy += dy
+
+        if (moveBatchJob?.isActive == true) return
+
+        moveBatchJob = viewModelScope.launch {
+            delay(16)
+            val x = pendingMoveDx
+            val y = pendingMoveDy
+            pendingMoveDx = 0
+            pendingMoveDy = 0
+            if (x != 0 || y != 0) ws.moveCursor(x, y, 0)
+        }
+    }
+
+    fun openBrowser() {
+        val c = _ui.value.cfg
+        val url = _ui.value.browserUrl
+        if (_ui.value.conn !is SamsungConnectionState.Connected) {
+            _ui.value = _ui.value.copy(restResult = "Not connected")
+            return
+        }
+
+        ws.openBrowser(url)
+
+        viewModelScope.launch {
+            delay(700)
+            val st = rest.appStatus(c.host, c.port, "org.tizen.browser")
+            _ui.value = _ui.value.copy(restResult = st?.take(4000) ?: "Browser status: null")
+        }
+    }
+
+    fun setRunAppId(v: String) {
+        _ui.value = _ui.value.copy(runAppId = v)
+    }
+
+    fun runAppWs(appType: String = "NATIVE_LAUNCH", meta: String = "") {
+        val c = _ui.value.cfg
+        val appId = _ui.value.runAppId
+        if (_ui.value.conn !is SamsungConnectionState.Connected) {
+            _ui.value = _ui.value.copy(restResult = "Not connected")
+            return
+        }
+
+        if (appType == "DEEP_LINK") {
+            ws.runApp(appId, "DEEP_LINK", meta)
+        } else {
+            ws.runApp(appId, "NATIVE_LAUNCH", meta)
+        }
+
+        viewModelScope.launch {
+            delay(700)
+            val st = rest.appStatus(c.host, c.port, appId)
+            if (st.isNullOrBlank()) {
+                val r = rest.appRun(c.host, c.port, appId)
+                _ui.value = _ui.value.copy(restResult = "WS sent. REST fallback=${r.orEmpty().take(2000)}")
+            } else {
+                _ui.value = _ui.value.copy(restResult = st.take(4000))
+            }
+        }
+    }
 
     fun refreshApps() {
         viewModelScope.launch {
@@ -250,7 +409,9 @@ class SamsungRemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun setRestAppId(v: String) { _ui.value = _ui.value.copy(restAppId = v) }
+    fun setRestAppId(v: String) {
+        _ui.value = _ui.value.copy(restAppId = v)
+    }
 
     fun restDeviceInfo() {
         val c = _ui.value.cfg
@@ -282,7 +443,10 @@ class SamsungRemoteViewModel(app: Application) : AndroidViewModel(app) {
         _ui.value = _ui.value.copy(restResult = r)
     }
 
-    fun setWolMac(v: String) { _ui.value = _ui.value.copy(wolMac = v) }
+    fun setWolMac(v: String) {
+        _ui.value = _ui.value.copy(wolMac = v)
+    }
+
     fun wolSend() {
         val ok = SamsungWol.send(_ui.value.wolMac)
         _ui.value = _ui.value.copy(wolResult = if (ok) "OK" else "Failed")
